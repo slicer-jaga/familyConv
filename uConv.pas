@@ -3,7 +3,8 @@ unit uConv;
 interface
 
 uses
-  System.SysUtils, System.Classes, System.Generics.Collections;
+  System.SysUtils, System.Classes, System.Generics.Collections,
+  Data.DB;
 
 type
   TFamilyConvertOptions = record
@@ -36,6 +37,15 @@ type
     FLine: TStringList;
     // Обработанные операции
     FTransactions: TStringList;
+    FFamilyFmt: TFormatSettings;
+    // Исходные категории
+    FConverterCategories: TStringList;
+    // Заменяемые категории
+    FReplacedCategories: TStringList;
+
+  const
+    C_SQLCategory =
+      'select t1.cat0_name, t2.cat0_name, t3.cat0_name from category left join cat0 t1 on t1.cat0_id = category.cat_id0 left join cat0 t2 on t2.cat0_id = category.cat_id1 left join cat0 t3 on t3.cat0_id = category.cat_id2 where category.cat_id = %s';
 
     procedure InitRemovedTags;
 
@@ -49,11 +59,27 @@ type
     procedure SaveBills;
 
     function CopyLine(const ALine: TArray<string>): TArray<string>;
+    procedure AddLineDirect(const AList: TStrings; const ALine: TArray<string>);
+
+    // Заменяет категории AReplacements на ACategory
+    procedure AddCategory(const ACategory: string; const AReplacements: TArray<string> = nil);
+
+    function GetBillFilename(const ABill: string): string;
+
+    function MergeLines(const ALines: TArray<string>;
+      const ADelimiter: string): string;
+
+    function GetCategories(const AID: string): TArray<string>;
+
+    // Возвращает новую категорию по старой категории и тегам
+    function FindCategory(const ACategory: string; const ATags: TArray<string>): string;
 
     // Преобразует категории в тэги, устраняет дублирование
     procedure ConvertCategoriesToTags(var ACategory, ATags, AComment: string);
     // Заменяет или удаляет лишние тэги
     procedure RemoveTags(const ATags: TStringList);
+
+    procedure ReadLine(const ALine: TArray<string>; const AFields: TFields);
   public
     function Convert(const AOptions: TFamilyConvertOptions): Boolean;
 
@@ -80,7 +106,8 @@ uses
   System.IOUtils,
   uConsts,
   uDB,
-  uZenmoney;
+  uZenmoney,
+  uBudgetBakers;
 
 { TFamilyConverterFactory }
 
@@ -89,6 +116,8 @@ class function TFamilyConverterFactory.GetConverterInstance(const AID: string)
 begin
   if (AID = '') or (AID = 'zm') then
     Result := TZenMoneyConverter.Create
+  else if AID = 'bb' then
+    Result := TBudgetBakersConverter.Create
   else
     Result := nil;
 
@@ -117,6 +146,7 @@ begin
     WriteLn('  /d'#9#9'Каталог выгружаемых файлов.');
     WriteLn('  /c'#9#9'Тип выгружаемого файла:');
     WriteLn('  '#9#9#9'"zm" - https://zenmoney.ru/');
+    WriteLn('  '#9#9#9'"bb" - https://budgetbakers.com/');
 
     Exit(False);
   end;
@@ -160,6 +190,32 @@ begin
   FBills.AddOrSetValue(ABill, lMoney);
 end;
 
+procedure TCustomFamilyConverter.AddCategory(const ACategory: string;
+  const AReplacements: TArray<string>);
+var
+  lIdx: NativeInt;
+  lRep: string;
+begin
+  lIdx := FConverterCategories.Add(ACategory);
+  for lRep in AReplacements do
+    FReplacedCategories.AddObject(lRep, TObject(lIdx));
+end;
+
+procedure TCustomFamilyConverter.AddLineDirect(const AList: TStrings;
+  const ALine: TArray<string>);
+var
+  lTmp: TStringList;
+begin
+  lTmp := TStringList.Create;
+  try
+    lTmp.Delimiter := ';';
+    lTmp.AddStrings(ALine);
+    AList.Add(lTmp.DelimitedText);
+  finally
+    lTmp.Free;
+  end;
+end;
+
 function TCustomFamilyConverter.Convert(const AOptions
   : TFamilyConvertOptions): Boolean;
 begin
@@ -197,7 +253,6 @@ end;
 procedure TCustomFamilyConverter.ConvertCategoriesToTags(var ACategory, ATags,
   AComment: string);
 var
-  lTag: string;
   lIdx: Integer;
   lCommentTag: string;
   lCommentTags: TArray<string>;
@@ -223,8 +278,17 @@ begin
   end;
 
   // Добавляет категорию в тэги
-  if (ACategory <> '') and (FTags.IndexOf(ACategory) = -1) then
-    FTags.Insert(0, ACategory);
+  if ACategory <> '' then
+  begin
+    lCommentTags := ACategory.Split([': ']);
+    lInsert := 0;
+    for lCommentTag in lCommentTags do
+      if (lCommentTag <> '') and (FTags.IndexOf(lCommentTag) = -1) then
+      begin
+        FTags.Insert(lInsert, lCommentTag);
+        Inc(lInsert);
+      end;
+  end;
 
   // Убирает дублирование комментария
   if (AComment <> '') and (FTags.IndexOf(AComment) <> -1) then
@@ -232,13 +296,7 @@ begin
 
   RemoveTags(FTags);
 
-  ATags := '';
-  for lTag in FTags do
-  begin
-    if ATags <> '' then
-      ATags := ATags + ', ';
-    ATags := ATags + lTag;
-  end;
+  ATags := MergeLines(FTags.ToStringArray, FTags.Delimiter);
 end;
 
 function TCustomFamilyConverter.CopyLine(const ALine: TArray<string>)
@@ -256,6 +314,15 @@ begin
   inherited;
 
   FBills := TDictionary<string, Currency>.Create;
+
+  FConverterCategories := TStringList.Create;
+
+  FReplacedCategories := TStringList.Create;
+  FReplacedCategories.Sorted := True;
+
+  FFamilyFmt := TFormatSettings.Create;
+  FFamilyFmt.ShortDateFormat := 'dd.mm.yyyy';
+  FFamilyFmt.DecimalSeparator := ',';
 
   FDefCategories := TStringList.Create;
   FDefCategories.Sorted := True;
@@ -282,6 +349,8 @@ begin
   FreeAndNil(FBills);
   FreeAndNil(FLine);
   FreeAndNil(FTransactions);
+  FreeAndNil(FConverterCategories);
+  FreeAndNil(FReplacedCategories);
   FreeAndNil(dmDB);
   inherited;
 end;
@@ -321,6 +390,50 @@ begin
   end;
 end;
 
+function TCustomFamilyConverter.GetBillFilename(const ABill: string): string;
+begin
+  Result := StringReplace(ABill, '\', '', [rfReplaceAll]);
+  Result := StringReplace(Result, '/', '', [rfReplaceAll]);
+  Result := StringReplace(Result, ':', '', [rfReplaceAll]);
+  Result := StringReplace(Result, '*', '', [rfReplaceAll]);
+  Result := StringReplace(Result, '?', '', [rfReplaceAll]);
+  Result := StringReplace(Result, '"', '', [rfReplaceAll]);
+  Result := StringReplace(Result, '<', '', [rfReplaceAll]);
+  Result := StringReplace(Result, '>', '', [rfReplaceAll]);
+  Result := StringReplace(Result, '|', '', [rfReplaceAll]);
+end;
+
+function TCustomFamilyConverter.GetCategories(const AID: string)
+  : TArray<string>;
+var
+  i: Integer;
+  lNewText, lText: string;
+begin
+  dmDB.sqlCategories.SQL.Text := Format(C_SQLCategory, [AID]);
+  dmDB.sqlCategories.Active := True;
+  if not dmDB.sqlCategories.Eof then
+  begin
+    Result := nil;
+    for i := 0 to dmDB.sqlCategories.Fields.Count - 1 do
+    begin
+      lText := dmDB.sqlCategories.Fields[i].Text;
+      if FRemovedTags.TryGetValue(lText, lNewText) then
+        lText := lNewText;
+
+      if lText = '' then
+        Break;
+
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := lText;
+
+      if (lText = 'Перевод') or (lText = 'Процент') then
+        Break;
+    end;
+  end
+  else
+    Result := [AID];
+end;
+
 procedure TCustomFamilyConverter.InitRemovedTags;
 begin
   FRemovedTags.Add('Развлечение', 'Развлечения');
@@ -329,6 +442,29 @@ begin
   FRemovedTags.Add('Перевод денег', 'Перевод');
   FRemovedTags.Add('Стоматолог', 'Стоматология');
   FRemovedTags.Add('Семейные расходы', 'Семья');
+end;
+
+function TCustomFamilyConverter.MergeLines(const ALines: TArray<string>;
+  const ADelimiter: string): string;
+var
+  lLine: string;
+begin
+  Result := '';
+  for lLine in ALines do
+  begin
+    if Result <> '' then
+      Result := Result + ADelimiter;
+    Result := Result + lLine;
+  end;
+end;
+
+procedure TCustomFamilyConverter.ReadLine(const ALine: TArray<string>;
+  const AFields: TFields);
+var
+  i: Integer;
+begin
+  for i := 0 to AFields.Count - 1 do
+    ALine[i] := AFields[i].Text;
 end;
 
 procedure TCustomFamilyConverter.RemoveTags(const ATags: TStringList);
@@ -351,6 +487,28 @@ begin
     end;
     Inc(i);
   end;
+end;
+
+function TCustomFamilyConverter.FindCategory(
+  const ACategory: string; const ATags: TArray<string>): string;
+var
+  lIdx: Integer;
+  lFinded: Integer;
+  lTag: string;
+begin
+  Result := ACategory;
+  if FReplacedCategories.Count = 0 then
+    Exit;
+
+  lFinded := MaxInt;
+  if FReplacedCategories.Find(ACategory, lIdx) and (lIdx < lFinded) then
+    lFinded := lIdx;
+  for lTag in ATags do
+    if FReplacedCategories.Find(lTag, lIdx) and (lIdx < lFinded) then
+      lFinded := lIdx;
+
+  if lFinded <> MaxInt then
+    Result := FConverterCategories[NativeInt(FReplacedCategories.Objects[lFinded])];
 end;
 
 procedure TCustomFamilyConverter.SaveBills;

@@ -4,7 +4,6 @@ interface
 
 uses
   System.SysUtils, System.Classes,
-  Data.DB,
   uConv;
 
 type
@@ -26,8 +25,12 @@ type
     C_zqcTransaction = 8;
     C_zqcInc = 9;
 
+    C_Header: array [0 .. 8] of string = ('Дата', 'Категория', 'Получатель',
+      'Счёт', 'Сумма (расход)', 'Счёт-получатель перевода', 'Сумма (доход)',
+      'Комментарий', 'Теги');
+
     // Основной запрос
-    C_SQL = 'select reestr.re_date, cat0.cat0_name, reestr.re_tag, reestr.re_koment, payee.payee_name, reestr.re_money, scheta.sch_name, reestr.re_id, reestr.re_trans_re, reestr.re_incr'
+    C_SQL = 'select reestr.re_date, re_cat_id, reestr.re_tag, reestr.re_koment, payee.payee_name, reestr.re_money, scheta.sch_name, reestr.re_id, reestr.re_trans_re, reestr.re_incr'
       + ' from reestr left join category on category.cat_id = reestr.re_cat_id left join cat0 on cat0.cat0_id = category.cat_id0'
       + ' left join payee on payee.payee_id = reestr.re_paye_id' +
       ' left join scheta on scheta.sch_id = reestr.re_sch_id';
@@ -40,13 +43,13 @@ type
 
     procedure DoConvert; override;
     procedure AddLine(const AValues: TArray<string>);
-    procedure ReadLine(const ALine: TArray<string>; const AFields: TFields);
 
     procedure GetTags(const AValues: TArray<string>;
       out ATags, AComment: string);
     procedure GetPayer(const AValues: TArray<string>; out APayer: string);
     function GetBill(const AValues: TArray<string>;
       out ASrcBill, ADec, ADstBill, AInc: string): Boolean;
+    function GetCategory(const AID: string): string;
   public
     constructor Create;
     destructor Destroy; override;
@@ -63,7 +66,7 @@ uses
 
 procedure TZenMoneyConverter.AddLine(const AValues: TArray<string>);
 var
-  lPayer, lTags, lSrcBill, lDstBill, lDec, lInc, lComment: string;
+  lPayer, lTags, lSrcBill, lDstBill, lDec, lInc, lComment, lCategory: string;
 begin
   // Пропуск пустой строки
   if (AValues[C_zqcDate] = '') or (StrToDate(AValues[C_zqcDate]) > Now) then
@@ -71,24 +74,28 @@ begin
 
   if not GetBill(AValues, lSrcBill, lDec, lDstBill, lInc) then
     Exit;
+
   GetTags(AValues, lTags, lComment);
   GetPayer(AValues, lPayer);
 
+  lCategory := AValues[C_zqcCategory].Replace(': ', ' / ');
+
   // Добавляем операции в соответствующие счета
-  if lSrcBill <> '' then
+  if (lSrcBill <> '') and (lDec <> '') then
     AddBill(lSrcBill, -StrToCurr(lDec, FFmt));
   if (lDstBill <> '') and (lDstBill <> lSrcBill) then
     AddBill(lDstBill, StrToCurr(lInc, FFmt));
 
   FLine.Clear;
   FLine.Add(AValues[C_zqcDate]);
-  FLine.Add(lTags);
+  FLine.Add(lCategory);
   FLine.Add(lPayer);
   FLine.Add(lSrcBill);
   FLine.Add(lDec);
   FLine.Add(lDstBill);
   FLine.Add(lInc);
   FLine.Add(lComment);
+  FLine.Add(lTags);
 
   FList.Add(FLine.DelimitedText);
 end;
@@ -114,17 +121,21 @@ procedure TZenMoneyConverter.DoConvert;
 var
   lLine: TArray<string>;
 begin
+  AddLineDirect(FList, [C_Header[0], C_Header[1], C_Header[2], C_Header[3],
+    C_Header[4], C_Header[5], C_Header[6], C_Header[7], C_Header[8]]);
+
   SetLength(lLine, dmDB.sqlReestr.Fields.Count);
   // Обход таблицы операций
   dmDB.sqlReestr.First;
   while not dmDB.sqlReestr.Eof do
   begin
     ReadLine(lLine, dmDB.sqlReestr.Fields);
+    lLine[C_zqcCategory] := GetCategory(lLine[C_zqcCategory]);
     AddLine(lLine);
     dmDB.sqlReestr.Next;
   end;
 
-  if FList.Count > 0 then
+  if FList.Count > 1 then
     FList.SaveToFile(FOptions.Directory + TPath.GetFileNameWithoutExtension
       (FOptions.Database) + '.csv', TEncoding.GetEncoding(1251))
   else
@@ -221,7 +232,9 @@ begin
     else
     begin
       // Доход
-      ASrcBill := '';
+
+      // Задать оба счета
+      ASrcBill := AValues[C_zqcBill];
       ADstBill := AValues[C_zqcBill];
       AInc := CurrToStr(Abs(lMoney), FFmt);
       ADec := '';
@@ -229,6 +242,11 @@ begin
   end;
 
   FTransactions.Add(AValues[C_zqcID]);
+end;
+
+function TZenMoneyConverter.GetCategory(const AID: string): string;
+begin
+  Result := MergeLines(GetCategories(AID), ': ');
 end;
 
 procedure TZenMoneyConverter.GetPayer(const AValues: TArray<string>;
@@ -248,15 +266,6 @@ begin
   ATags := AValues[C_zqcTag];
   AComment := AValues[C_zqcComment];
   ConvertCategoriesToTags(lCategory, ATags, AComment);
-end;
-
-procedure TZenMoneyConverter.ReadLine(const ALine: TArray<string>;
-  const AFields: TFields);
-var
-  i: Integer;
-begin
-  for i := 0 to AFields.Count - 1 do
-    ALine[i] := AFields[i].Text;
 end;
 
 end.
