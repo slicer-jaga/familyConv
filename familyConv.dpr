@@ -8,7 +8,8 @@ uses
   uDB in 'uDB.pas' {dmDB: TDataModule},
   uZenmoney in 'uZenmoney.pas',
   uConv in 'uConv.pas',
-  uConsts in 'uConsts.pas';
+  uConsts in 'uConsts.pas',
+  uBudgetBakers in 'uBudgetBakers.pas';
 
 var
   lConv: IFamilyConverter;
